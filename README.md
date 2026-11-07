@@ -2,6 +2,8 @@
 
 > 基于参考文章进行环境配置与项目搭建。
 
+Ubuntu 22.04 / RTX 5060 用户请参阅 [复现说明](REPRODUCE.zh-CN.md)，其中包含 CUDA 12.8、自定义算子编译、DeepSeek 视觉接口和 MuJoCo 抓放验证。
+
 [![Project Status](https://img.shields.io/badge/status-active-brightgreen)](https://github.com/graspnet/graspnet-baseline)  
 [![Python Version](https://img.shields.io/badge/python-3.10-blue)](https://www.python.org/downloads/release/python-3100/)
 

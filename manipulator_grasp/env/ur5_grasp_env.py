@@ -48,7 +48,7 @@ class UR5GraspEnv:
         self.glfw_window = None
 
 
-    def reset(self):
+    def reset(self, *, graphics=True):
 
         # 初始化 MuJoCo 模型和数据
         filename = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets', 'scenes', 'scene.xml')
@@ -74,6 +74,9 @@ class UR5GraspEnv:
         # 计算机械臂末端执行器的初始姿态。
         self.robot_T = self.robot.fkine(self.robot_q)
         self.T0 = self.robot_T.copy()
+
+        if not graphics:
+            return
 
         # 创建两个渲染器实例，分别用于生成彩色图像和深度图
         self.mj_renderer = mujoco.renderer.Renderer(self.mj_model, height=self.height, width=self.width)
@@ -142,7 +145,8 @@ class UR5GraspEnv:
             self.mj_data.ctrl[:] = action
         mujoco.mj_step(self.mj_model, self.mj_data)
 
-        self.mj_viewer.sync()
+        if self.mj_viewer is not None:
+            self.mj_viewer.sync()
 
         # # --- 新增: 离屏渲染和显示 ---
         # if all([self.offscreen_context, self.offscreen_scene, self.offscreen_camera]):

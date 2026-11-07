@@ -135,7 +135,7 @@ def get_and_process_data(color_path, depth_path, mask_path):
 
 
 # ==================== 主函数：获取抓取预测 ====================
-def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
+def run_grasp_inference(color_path, depth_path, sam_mask_path=None, *, visual=True, all_candidates=False):
     # 1. 加载网络
     net = get_net()
 
@@ -149,15 +149,40 @@ def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
 
     # 4. 构造 GraspGroup 对象（这里 gg 是列表或类似列表的对象）
     gg = GraspGroup(grasp_preds[0].detach().cpu().numpy())
+    if not len(gg):
+        return gg
 
     # 5. 碰撞检测
     COLLISION_THRESH = 0.01
     if COLLISION_THRESH > 0:
         voxel_size = 0.01
         collision_thresh = 0.01
-        mfcdetector = ModelFreeCollisionDetector(np.asarray(cloud_o3d.points), voxel_size=voxel_size)
-        collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
+        if all_candidates:
+            height, width = depth_path.shape
+            focal = height / (2 * np.tan(np.pi / 8))
+            camera = CameraInfo(width, height, focal, focal, width / 2, height / 2, 1.)
+            scene = create_point_cloud_from_depth_image(depth_path, camera, organized=True)
+            valid = np.isfinite(depth_path) & (depth_path > 0) & (depth_path < 2)
+            points = scene[valid]
+            gg = gg.nms().sort_by_score()
+        else:
+            points = np.asarray(cloud_o3d.points)
+        mfcdetector = ModelFreeCollisionDetector(points, voxel_size=0.005 if all_candidates else voxel_size)
+        if all_candidates:
+            collision_mask, empty = mfcdetector.detect(
+                gg, approach_dist=0.05, collision_thresh=collision_thresh, return_empty_grasp=True)
+            collision_mask |= empty
+            if collision_mask.all():
+                # Thin objects can be rejected by the visible-point heuristic.
+                # The caller must still validate contact and placement in MuJoCo.
+                print("严格点云筛选无候选，改用较宽松的点云阈值后进行仿真验证。", flush=True)
+                collision_mask = mfcdetector.detect(
+                    gg, approach_dist=0.05, collision_thresh=0.05)
+        else:
+            collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
         gg = gg[~collision_mask]
+    if all_candidates or not len(gg):
+        return gg
 
     # 6. NMS 去重 + 按照得分排序（降序）
     gg.nms().sort_by_score()
@@ -284,7 +309,6 @@ def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
     new_gg = GraspGroup()            # 初始化空的 GraspGroup
     new_gg.add(best_grasp)           # 添加最佳抓取
 
-    visual = True
     if visual:
         grippers = new_gg.to_open3d_geometry_list()
         o3d.visualization.draw_geometries([cloud_o3d, *grippers])
@@ -296,7 +320,7 @@ def run_grasp_inference(color_path, depth_path, sam_mask_path=None):
 
 
 # ================= 仿真执行抓取动作 ====================
-def execute_grasp(env, gg):
+def execute_grasp(env, gg, *, direct_approach=False, after_lift=None):
     """
     执行抓取动作，控制机器人从初始位置移动到抓取位置，并完成抓取操作。
 
@@ -327,6 +351,15 @@ def execute_grasp(env, gg):
     time1 = 1
     q0 = robot.get_joint()
     q1 = np.array([0.0, 0.0, np.pi / 2, 0.0, -np.pi / 2, 0.0])
+    T2 = T_wo * sm.SE3(-0.1, 0.0, 0.0)
+    if direct_approach:
+        robot.set_joint(q1)
+        q1 = robot.ikine(T2)
+        robot.set_joint(q0)
+        if len(q1) != 6 or not np.isfinite(q1).all():
+            raise ValueError("接近点无有效逆解")
+        q1 = q0 + (q1 - q0 + np.pi) % (2 * np.pi) - np.pi
+        time1 = 2.5
     parameter0 = JointParameter(q0, q1)
     velocity_parameter0 = QuinticVelocityParameter(time1)
     trajectory_parameter0 = TrajectoryParameter(parameter0, velocity_parameter0)
@@ -357,10 +390,16 @@ def execute_grasp(env, gg):
     # 2.接近抓取位姿
     # 目标：从预抓取位姿直线移动到抓取点附近（T2）
     # 关键点：T2 是 T_wo 沿负 x 方向偏移 0.1m，确保安全接近物体。
+    if not direct_approach:
+        _move_to_approach(env, robot, action, q1, T2)
+
+    _finish_grasp(env, robot, action, q0, T2, T_wo, after_lift)
+
+
+def _move_to_approach(env, robot, action, q1, T2):
     time2 = 1
     robot.set_joint(q1)
     T1 = robot.get_cartesian()
-    T2 = T_wo * sm.SE3(-0.1, 0.0, 0.0)
     position_parameter1 = LinePositionParameter(T1.t, T2.t) #  位置规划（直线路径）
     attitude_parameter1 = OneAttitudeParameter(sm.SO3(T1.R), sm.SO3(T2.R)) # 姿态规划（插值旋转）
     cartesian_parameter1 = CartesianParameter(position_parameter1, attitude_parameter1) # 组合笛卡尔参数
@@ -390,6 +429,7 @@ def execute_grasp(env, gg):
                 env.step(action)
                 break
 
+def _finish_grasp(env, robot, action, q0, T2, T_wo, after_lift):
     # 3.执行抓取
     # 目标：从 T2 移动到 T3（精确抓取位姿）。通过逐步增加 action[-1]（夹爪控制信号）闭合夹爪，抓取物体。
     time3 = 1
@@ -467,7 +507,11 @@ def execute_grasp(env, gg):
     time_step_num = round(total_time / 0.002) + 1
     times = np.linspace(0.0, total_time, time_step_num)
     time_cumsum = np.cumsum(time_array)
+    lift_checked = False
     for timei in times:
+        if after_lift is not None and not lift_checked and timei > time4:
+            after_lift()
+            lift_checked = True
         for j in range(len(time_cumsum)):
             if timei == 0.0:
                 break

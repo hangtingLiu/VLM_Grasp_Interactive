@@ -3,21 +3,17 @@ import numpy as np
 import torch
 from ultralytics.models.sam import Predictor as SAMPredictor
 
-import whisper
 import json
+import os
 import re
 import base64
 import textwrap
-import queue
-import time
-import io
+import shutil
+import subprocess
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
-import soundfile as sf  
-import sounddevice as sd
-from scipy.io.wavfile import write
-from pydub import AudioSegment
-
-from openai import OpenAI  # 导入OpenAI客户端
+from openai import DefaultHttpxClient, OpenAI
 
 import logging
 # 禁用 Ultralytics 的日志输出
@@ -53,9 +49,19 @@ def generate_robot_actions(user_command, image_input=None):
     返回一个 dict，包含 "response" 和 "coordinates"。
     参数 image_input 为 numpy 数组（BGR 格式）。
     """
-    # 初始化OpenAI客户端
-    # 替换为自己的模型调用，没有本地部署的，可以参考该网站 https://sg.uiuiapi.com/v1
-    client = OpenAI(api_key='', base_url="")
+    local_config = Path(__file__).with_name(".vlm.local.json")
+    if local_config.is_file():
+        config = json.loads(local_config.read_text(encoding="utf-8"))
+        api_key = Path(config["api_key_file"]).expanduser().read_text(encoding="utf-8-sig").strip()
+        base_url, model = config["base_url"], config["model"]
+        trust_env = config.get("trust_env", True)
+    else:
+        api_key = os.environ.get("VLM_API_KEY", "").strip()
+        base_url = os.environ.get("VLM_BASE_URL", "").strip()
+        model = os.environ.get("VLM_MODEL", "").strip()
+        trust_env = True
+    if not all((api_key, base_url, model)):
+        raise RuntimeError("请检查 .vlm.local.json 或设置 VLM_API_KEY、VLM_BASE_URL、VLM_MODEL。")
 
     system_prompt = textwrap.dedent("""\
     你是一个精密机械臂视觉控制系统，具备先进的多模态感知能力。请严格按照以下步骤执行任务：
@@ -88,6 +94,11 @@ def generate_robot_actions(user_command, image_input=None):
     user_content = []
 
     if image_input is not None:
+        height, width = image_input.shape[:2]
+        messages[0]["content"] += (
+            f"\n原图宽 {width} 像素、高 {height} 像素。"
+            "请使用原图像素坐标，原点在左上角。"
+        )
         base64_img = encode_np_array(image_input)
         user_content.append({
             "type": "image_url",
@@ -100,16 +111,11 @@ def generate_robot_actions(user_command, image_input=None):
     messages.append({"role": "user", "content": user_content})
 
     try:
-        # 使用OpenAI客户端调用API
-        completion = client.chat.completions.create(
-            model="qwen-vl-plus",  # 指定模型名称，请确认服务提供商支持的模型名
-            # model="qwen-vl-max", 
-            # model="gpt-5",
-            # model="qwen2.5-vl-32b-instruct",
-            messages=messages,
-            # max_tokens=4096,  # 可根据需要调整
-            temperature=0.1,   # 降低温度以提高输出的确定性，对结构化输出有益
-        )
+        with OpenAI(api_key=api_key, base_url=base_url,
+                    http_client=DefaultHttpxClient(trust_env=trust_env)) as client:
+            completion = client.chat.completions.create(
+                model=model, messages=messages, temperature=0.1,
+            )
         
         content = completion.choices[0].message.content
         print("原始响应：", content)
@@ -134,7 +140,7 @@ def generate_robot_actions(user_command, image_input=None):
         }
 
     except Exception as e:
-        print(f"请求失败：{e}")
+        print("请求失败：" + str(e).replace(api_key, "[REDACTED]"))
         return {"response": "处理失败", "coordinates": {}}
 
 # ----------------------- SAM 分割相关 -----------------------
@@ -176,159 +182,105 @@ def process_sam_results(results):
 
 # ----------------------- 语音识别与 TTS -----------------------
 
-# 初始化全局模型变量
-_global_models = {}
-
-
-def load_models():
-    """在需要时加载模型，避免启动时全部加载占用资源"""
-    if not _global_models:
-        print("🔄 正在加载离线语音模型...")
-        # 加载Whisper小型模型 (适合你的6GB显存)
-        # _global_models['asr'] = whisper.load_model("small")
-        # _global_models['asr'] = whisper.load_model("tiny")
-        # _global_models['asr'] = whisper.load_model("base")
-        print("✅ Whisper的base模型加载完毕")
-
-        try:
-            import pyttsx3
-            _global_models['tts_backup'] = pyttsx3.init()
-            # 配置TTS
-            _global_models['tts_backup'].setProperty('rate', 160)  # 语速
-            voices = _global_models['tts_backup'].getProperty('voices')
-            for voice in voices:
-                if 'chinese' in voice.name.lower() or 'zh' in voice.id.lower():
-                    _global_models['tts_backup'].setProperty('voice', voice.id)
-                    break
-            print("✅ TTS (pyttsx3) 初始化完毕")
-        except Exception as e:
-            print(f"⚠️  TTS初始化失败: {e}")
-            _global_models['tts_backup'] = None
-
-    return _global_models
-
-
-# 音频参数配置
 samplerate = 16000
-channels = 1
-dtype = 'int16'
-frame_duration = 0.2
-frame_samples = int(frame_duration * samplerate)
-silence_threshold = 250
-silence_max_duration = 2.0
-q = queue.Queue()
 
 
-def rms(audio_frame):
-    samples = np.frombuffer(audio_frame, dtype=np.int16)
-    if samples.size == 0:
-        return 0
-    mean_square = np.mean(samples.astype(np.float32) ** 2)
-    if np.isnan(mean_square) or mean_square < 1e-5:
-        return 0
-    return np.sqrt(mean_square)
+def recognize_speech(seconds=5):
+    """Capture a short command from the default Ubuntu microphone."""
+    if shutil.which("parec") is None:
+        raise RuntimeError("找不到 parec，请安装 Ubuntu 的 pulseaudio-utils。")
+    print(f"请在 {seconds:g} 秒内说出指令，例如「抓苹果」。", flush=True)
+    try:
+        subprocess.run(
+            ["parec", "--raw", "--format=s16le", "--rate=16000", "--channels=1"],
+            capture_output=True, check=True, timeout=seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pcm = exc.stdout or b""
+        audio = np.frombuffer(pcm[:len(pcm) // 2 * 2], dtype="<i2")
+        if not audio.size:
+            raise RuntimeError("麦克风没有返回音频，请检查 Ubuntu 声音设置。") from exc
+        return audio
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("录音失败：" + exc.stderr.decode(errors="replace").strip()) from exc
+    raise RuntimeError("录音提前结束。")
 
-def callback(indata, frames, time_info, status):
-    if status:
-        print("⚠️ 状态警告：", status)
-    q.put(bytes(indata))
-
-def recognize_speech():
-    """录音并返回音频数据（numpy 数组）"""
-    print("🎙️ 启动录音，请说话...")
-    # print("💡 调试信息：正在监测实时音量（RMS），请观察不说话时的基础噪音值")
-    audio_buffer = []
-    is_speaking = False
-    last_voice_time = time.time()
-
-    with sd.RawInputStream(samplerate=samplerate, blocksize=frame_samples,
-                           dtype=dtype, channels=channels, callback=callback):
-        while True:
-            frame = q.get()
-            volume = rms(frame)
-            current_time = time.time()
-
-            # print(f"实时音量（RMS）: {volume}") 
-
-            if volume > silence_threshold:
-                if not is_speaking:
-                    print("🎤 检测到语音，开始录音...")
-                    is_speaking = True
-                    audio_buffer = []
-                audio_np = np.frombuffer(frame, dtype=np.int16)
-                audio_buffer.append(audio_np)
-                last_voice_time = current_time
-            elif is_speaking and (current_time - last_voice_time > silence_max_duration):
-                print("🛑 停止录音，准备识别...")
-                full_audio = np.concatenate(audio_buffer, axis=0)
-                return full_audio
-            elif not is_speaking and (current_time - last_voice_time > 10.0):
-                print("🛑 超时：未检测到语音输入")
-                return np.array([], dtype=np.int16)
 
 def speech_to_text_offline(audio_data):
-    """
-    使用离线Whisper模型将录音数据转换为文本
-    """
-    print("📡 正在进行离线语音识别...")
-    models = load_models()
-    asr_model = models['asr']
+    """Transcribe 16 kHz PCM without an FFmpeg subprocess."""
+    import whisper
 
-    # 保存临时音频文件
-    temp_wav = "temp_audio.wav"
-    write(temp_wav, samplerate, audio_data.astype(np.int16))
-
-    try:
-        # 使用Whisper进行识别，指定语言为中文以提高精度和速度
-        result = asr_model.transcribe(temp_wav, language="zh", fp16=torch.cuda.is_available())
-        return result["text"].strip()
-    except Exception as e:
-        print(f"❌ 离线语音识别失败: {e}")
+    samples = audio_data.astype(np.float32) / 32768.0
+    frame_size = samplerate // 50
+    frames = samples[:samples.size // frame_size * frame_size].reshape(-1, frame_size)
+    if not len(frames):
         return ""
+    levels = np.sqrt(np.mean(frames**2, axis=1))
+    active = np.flatnonzero(levels >= max(0.001, float(levels.max()) * 0.08))
+    if not active.size:
+        return ""
+    padding = samplerate // 4
+    first = max(0, int(active[0]) * frame_size - padding)
+    last = int(active[-1] + 1) * frame_size + padding
+    samples = samples[first:last]
+    # Keep GPU memory available for SAM and GraspNet.
+    cache = Path(__file__).resolve().parent / "outputs" / "whisper"
+    model = whisper.load_model("base", device="cpu", download_root=str(cache))
+    result = model.transcribe(samples, language="zh", fp16=False, temperature=0,
+                              condition_on_previous_text=False, sample_len=32)
+    return normalize_voice_command(result["text"])
+
+
+def normalize_voice_command(text):
+    """Collapse repeated copies of the same known command, including stray digits."""
+    text = text.strip()
+    for target in ("苹果", "蘋果", "香蕉", "锤子", "錘子", "刀", "小鸭", "小鴨"):
+        command = f"抓{target}"
+        if re.fullmatch(rf"(?:{command}[\s\d，。！？,.!?]*)+", text):
+            return command
+    return text
+
+
+def tts_command(output=None):
+    """Build an offline Mandarin eSpeak NG command."""
+    local = Path(__file__).resolve().parent / "outputs" / "tools" / "usr" / "bin" / "espeak-ng"
+    executable = shutil.which("espeak-ng") or (str(local) if local.is_file() else None)
+    if executable is None:
+        raise RuntimeError("找不到 espeak-ng，无法播报。")
+    command = [executable, "-v", "cmn", "-s", "155"]
+    if output is not None:
+        command.extend(["-w", str(output)])
+    return [*command, "--stdin"]
+
 
 def play_tts_offline(text):
-    """
-    使用离线TTS模型将文本转换为语音并播放
-    """
     if not text:
         return
-        
-    print(f"📢 离线TTS播放: {text}")
-    models = load_models()
-
     try:
-        if models['tts_backup'] is not None:
-            models['tts_backup'].say(text)
-            models['tts_backup'].runAndWait()
-
-    except Exception as e:
-        print("❌ 无可用TTS引擎")
+        with TemporaryDirectory(prefix="vlm-speech-") as folder:
+            audio = Path(folder) / "speech.wav"
+            subprocess.run(tts_command(audio), input=text.encode(), check=True)
+            subprocess.run(["paplay", str(audio)], check=True)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"离线播报失败：{exc}", flush=True)
 
 
 def voice_command_to_keyword():
-    """
-    获取语音命令并转换为文本。
-    直接返回识别的文本指令。
-    """
-    audio_data = recognize_speech()
-    text = speech_to_text_offline(audio_data) # 改为调用离线ASR
-    if not text:
-        print("⚠️ 没有识别到文本")
-        return ""
-    print("📝 识别文本：", text)
-    # play_tts_offline(f"已收到指令: {text}") # 改为调用离线TTS
+    text = speech_to_text_offline(recognize_speech())
+    if text:
+        print(f"识别到：{text}", flush=True)
     return text
 
 
 # ----------------------- 主流程：图像分割 -----------------------
-def segment_image(image_input, output_mask='mask1.png'):
+def segment_image(image_input, output_mask='mask1.png', *, command=None, speak=True, interactive=True):
     # 1. 使用文字获取目标指令
     print("📝 请通过文字描述目标物体及抓取指令...")
-    command_text = input("请输入: ").strip()
+    command_text = (input("请输入: ") if command is None else command).strip()
     if not command_text:
-        print("⚠️ 未识别到语音指令，请重试。")
+        print("⚠️ 未收到抓取指令，请重试。")
         return None
-    print(f"✅ 识别的语音指令：{command_text}")
+    print(f"✅ 收到抓取指令：{command_text}")
 
     # # 1. 使用语音获取目标指令
     # print("🎙️ 请通过语音描述目标物体及抓取指令...")
@@ -346,16 +298,22 @@ def segment_image(image_input, output_mask='mask1.png'):
     print("检测到的物体信息：", detection_info)
 
     # 仅对模型返回的自然语言回应播报
-    play_tts_offline(natural_response)
+    if speak:
+        play_tts_offline(natural_response)
     
-    bbox = detection_info.get("bbox") if detection_info and "bbox" in detection_info else None
+    bbox = detection_info.get("bbox") if isinstance(detection_info, dict) else None
+    height, width = image_input.shape[:2]
+    if not (isinstance(bbox, list) and len(bbox) == 4 and
+            all(type(value) is int for value in bbox) and
+            0 <= bbox[0] < bbox[2] <= width and 0 <= bbox[1] < bbox[3] <= height):
+        bbox = None
+    if bbox is None and not interactive:
+        return None
     
     # 3. 准备图像供 SAM 使用（转换为 RGB）
-    image_rgb = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
-
     # 4. 初始化 SAM，并设置图像
     predictor = choose_model()
-    predictor.set_image(image_rgb)
+    predictor.set_image(image_input)
 
     if bbox:
         results = predictor(bboxes=[bbox])
