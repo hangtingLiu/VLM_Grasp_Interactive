@@ -1,0 +1,5 @@
+{
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "api_key_file": "~/.config/vlm-grasp/deepseek.key"
+}
